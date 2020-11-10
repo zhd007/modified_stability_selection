@@ -1,0 +1,838 @@
+---
+title: "Modified STABS LASSO simulation: mixed group, multiple rounds, template"
+author: "Zhuoran Ding"
+date: "5/19/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## This is a scipt for comparing variable selection performance of modifed methods on data with predictor group structure.
+
+
+### Simulation parameters and packages
+
+```{r}
+
+# simulation parameters
+round <- 100
+p <- 100
+sample_size <- 80
+ratio <- 0.05
+beta <- rep(1.5, p * ratio) + rnorm(p * ratio, mean = 0, sd = 0.1)
+#group <- rep(5, 20)
+#group <- rep(10, 10)
+group <- c(rep(c(5,10), 5), rep(5, 5))
+#rho <- c(0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3)
+#rho <- runif(length(group), min = 0.2, max = 0.6)
+#rho <- c(runif(p * ratio, min = 0.5, max = 0.6),   c(runif(length(group)-p * ratio, min = 0.2, max = 0.3)))
+rho <- c(runif(p * ratio, min = 0.2, max = 0.3),   c(runif(length(group)-p * ratio, min = 0.5, max = 0.6)))
+#true_beta_indicator <- c(rep(1, length(beta)), rep(0, p-length(beta)))
+# true_beta_indicator <- c(rep(1, 10), rep(0, 91-10))
+
+
+################### double p ###################
+# round <- 100
+# p <- 182
+# sample_size <- 100
+# ratio <- 0.05
+# beta <- rep(1.2, ceiling(182 * 0.05))
+# # ratio <- 0.1
+# # beta <- rep(1.2, 10)
+# group <- c(5, 5, 10, 10, 11, 11, 20, 20, rep(5, 18))
+# #rho <- c(0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3)
+# rho <- runif(length(group), min = 0.2, max = 0.6)
+# #rho <- c(runif(5, min = 0.5, max = 0.6),   c(runif(length(group)-5, min = 0.2, max = 0.3)))
+# #rho <- c(runif(5, min = 0.2, max = 0.3),   c(runif(length(group)-5, min = 0.5, max = 0.6)))
+# #true_beta_indicator <- c(rep(1, 5), rep(0, 91-5))
+# #true_beta_indicator <- c(rep(1, 10), rep(0, 91-10))
+
+#
+real_p <- ceiling(p * ratio)
+
+  
+# get true beta indicator
+true_beta_index <- c()
+position <- 1
+for (i in 1:real_p) {
+  true_beta_index[length(true_beta_index) + 1] <- position
+  position <- position + group[i]
+}
+print(paste("The true predictors are:", paste(true_beta_index, collapse = ", ")))
+
+true_beta_indicator <- rep(0, p)
+true_beta_indicator[true_beta_index] <- 1
+```
+
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(magrittr)
+library(glmnet)
+library(devtools)
+library(stabs)
+library(lars)
+library(ClusterR)
+library(dplyr)
+library(MASS) 
+library(clusterGeneration)
+library(caret)
+library(gplots)
+library(BhGLM)
+library(pROC)
+library(stringr)
+library(ExclusiveLasso)
+library(gglasso)
+```
+
+
+### Functions
+
+```{r}
+#### simulation function - mixed group: ####
+#### simulate binary outcomes and *grouped, correlated* covariates
+# *** The first p * ratio groups' first covariates are the true predictors.
+# *** The length of group needs to be greater than or equal to p * ratio.
+# group - a vector that indicate size of each group, needs to sum up to p
+# rho - a vector of correlation for each group, the length should be the same as
+#       the length of group
+#       the default is a zero vector
+# n - number of observations, the default is 1000
+# p - number of covariates, the default is 5000
+# ratio - the ratio of true predictors, the default is 0.002 (5000 * 0.002 = 10 true)
+# beta - a vactor of beta coefficients, need to have length ceiling(p * ratio), 
+#        the default is a vector of 1 and 0 based on the true predictor ratio
+sim_binary_outcome_mixed_group <- function(n = 100, p = 5000, ratio = 0.002, beta = -9, group = c(p), rho = rep(0, length(group))) {
+  
+  # compute real p
+  real_p <- ceiling(p * ratio)
+  #print(paste("The first", real_p, "features are the true predictors."))
+  
+  # check if there is input beta
+  if (length(beta) == 1) {
+    # no input beta
+    print("No input beta. The default is a vector of 1 and 0 based on the true predictor ratio.")
+    
+    true_beta <- rep(0, p)
+    
+    # update first p * ratio groups' first covariates
+    position <- 1
+    for (i in 1:real_p) {
+      true_beta[position] <- 1
+      position <- position + group[i]
+    }
+    
+  } else {
+    # input beta present
+    #print("The input beta is: ")
+    #print(beta)
+    if (length(beta) != real_p) {
+      print("The lengh of beta does not match with the true predictor ratio")
+      return(-999)
+    }
+    true_beta <- rep(0, p)
+    
+    # update first p * ratio groups' first covariates
+    position <- 1
+    for (i in 1:real_p) {
+      true_beta[position] <- beta[i]
+      position <- position + group[i]
+    }
+    
+    
+    
+  }
+  
+  # # generate x with group structure
+  # # This chunk is for fixed group size.
+  # x <- matrix(rnorm(n * p), nrow = n, ncol = p)  
+  # step <- floor(p / ng)
+  # #print(paste("Number of features within a group is:", step))
+  # for (j in 1:ng) {
+  #   start <- (j-1) * step + 1
+  #   end <- j*step
+  #   for (i in ((start+1):end)) {
+  #     x[,i] <- rho[j] * x[,start] + (1-rho[j]) * x[,i]
+  #   }
+  # }
+  
+  # check if input group vector is correct
+  if (sum(group) != p) {
+    print("Input group vector != p")
+    return(-999)
+  }
+  
+  # generate x with group structure
+  # note: need to consider the relation between true betas and group structure
+  x <- matrix(rnorm(n * p), nrow = n, ncol = p) 
+  counter <- 1 
+  for (j in 1:length(group)) {
+    start <- counter 
+    end <- counter + group[j] - 1
+    #print(c(start, end))
+    #print(end - start + 1)
+    for (i in (start:end)) {
+      x[,i] <- rho[j] * x[,start] + (1-rho[j]) * x[,i]
+    }
+    counter <- counter + group[j]
+  }
+  
+  
+
+  # generate the linear equation
+  xb <- x %*% true_beta
+  xb <- xb[,1]
+  
+  # generate prob and y
+  pr <- exp(xb) / (1 + exp(xb))
+  y = rbinom(n = n, size = 1, prob = pr)
+  
+  yx <- cbind(y, as.data.frame(x))
+  return(yx)
+}
+```
+
+
+```{r}
+#### modifed << standard >> stabs lasso - subsample features based on the group structure
+#### subsample 50% features from each corrected group
+stabs_stabdard_lasso <- function(x, y, group, iteration = 100, prop = 0.5){
+  
+  freq <- rep(0, ncol(x))
+  ng <- length(group)
+  
+  for (i in 1:iteration) {
+    #print(paste("This is iteration:", i))
+    # randomly select some proportion of features from each correlated group
+    selected <- vector(mode = "logical", length = 0)
+    position <- 1
+    #index <- 0
+    for (j in 1:ng) {
+      start <- position
+      position <- position + group[j]
+      end <- position-1
+      
+      select_num <- floor(group[j] * prop)
+      select_temp <- sample(start:end, size = select_num, replace = FALSE)
+      for (k in 1:select_num) {
+        selected[length(selected)+1] <- select_temp[k]
+      }
+      #index <- index + select_num
+    }
+    selected <- sort(selected)
+  
+    x.selected <- x[,selected]
+    #print(dim(x.selected))
+  
+    # apply standard lasso on subsampled data
+    # apply standard lasso
+    sub.lasso <- cv.glmnet(x = x.selected, y = y, family = "binomial", type.measure = "class", 
+                          alpha = 1, nfolds = 10, standardize = FALSE)
+  
+    sub.lasso.coef <- coef(sub.lasso, s = sub.lasso$lambda.min)
+    sub.lasso.coef <- sub.lasso.coef[-1]
+    #print(sub.lasso.coef)
+    #selected[which(sub.lasso.coef != 0)]
+  
+    # increment the frequence vector
+    freq[selected[which(sub.lasso.coef != 0)]] <- freq[selected[which(sub.lasso.coef != 0)]] + 1
+  }
+  
+  return(freq)
+}
+```
+
+```{r}
+#### modifed << adaptive >> stabs lasso - subsample features based on the group structure
+#### subsample 50% features from each corrected group
+stabs_adaptive_lasso <- function(x, y, group, iteration = 100, prop = 0.5){
+  
+  freq <- rep(0, ncol(x))
+  ng <- length(group)
+  
+  for (i in 1:iteration) {
+    #print(paste("This is iteration:", i))
+    # randomly select some proportion of features from each correlated group
+    selected <- vector(mode = "logical", length = 0)
+    position <- 1
+    #index <- 0
+    for (j in 1:ng) {
+      start <- position
+      position <- position + group[j]
+      end <- position-1
+      
+      select_num <- floor(group[j] * prop)
+      select_temp <- sample(start:end, size = select_num, replace = FALSE)
+      for (k in 1:select_num) {
+        selected[length(selected)+1] <- select_temp[k]
+      }
+      #index <- index + select_num
+    }
+    selected <- sort(selected)
+  
+    x.selected <- x[,selected]
+    #print(dim(x.selected))
+  
+    # apply adaptive lasso on subsampled data
+    ridge <- cv.glmnet(x = x.selected, y = y, nfold = 10,
+                       alpha = 0, family = "binomial", standardize = FALSE)
+    coef.ridge <- as.numeric(coef(ridge, s = ridge$lambda.min))[-1]
+
+    ## Perform adaptive LASSO with 10-fold CV
+    alasso <- cv.glmnet(x = x.selected, y = y, nfold = 10, alpha = 1,
+                                penalty.factor = 1 / abs(coef.ridge),
+                                keep = TRUE,  type.measure = "class", 
+                                family = "binomial", standardize = TRUE)
+  
+    sub.lasso.coef <- coef(alasso, s = alasso$lambda.min)
+    sub.lasso.coef <- sub.lasso.coef[-1]
+    #print(sub.lasso.coef)
+    #selected[which(sub.lasso.coef != 0)]
+  
+    # increment the frequence vector
+    freq[selected[which(sub.lasso.coef != 0)]] <- freq[selected[which(sub.lasso.coef != 0)]] + 1
+  }
+  
+  return(freq)
+}
+```
+
+```{r}
+#### modifed << group >> stabs lasso - subsample features based on the group structure
+#### subsample 50% features from each corrected group
+#### **** addition need: group indicator for group lasso
+stabs_group_lasso <- function(x, y, group, group_indicator, iteration = 100, prop = 0.5){
+  
+  freq <- rep(0, ncol(x))
+  ng <- length(group)
+  y[y==0] <- -1
+  
+  for (i in 1:iteration) {
+    #print(paste("This is iteration:", i))
+    
+    # randomly select some proportion of features from each correlated group
+    selected <- vector(mode = "logical", length = 0)
+    position <- 1
+    #index <- 0
+    for (j in 1:ng) {
+      start <- position
+      position <- position + group[j]
+      end <- position-1
+      
+      select_num <- floor(group[j] * prop)
+      select_temp <- sample(start:end, size = select_num, replace = FALSE)
+      for (k in 1:select_num) {
+        selected[length(selected)+1] <- select_temp[k]
+      }
+      #index <- index + select_num
+    }
+    selected <- sort(selected)
+  
+    # apply group lasso on subsampled data
+    x.selected <- x[,selected]
+    
+    # need to make a consecutive integer list from selected_indicator
+    selected_indicator <- group_indicator[selected]
+    consecutive <- rep(1, length(selected))
+    for (j in 2:length(selected)) {
+      if (selected_indicator[j] > selected_indicator[j-1]) {
+        consecutive[j:length(selected)] <- consecutive[j-1] + 1
+      }
+    }
+    
+    grp.lasso <- cv.gglasso(x = x.selected, y = y, loss="logit", group = consecutive, 
+                    nfolds=10, nlambda = 200)
+  
+    grp.lasso.coef <- coef(grp.lasso, s = grp.lasso$lambda.min)
+    grp.lasso.coef <- grp.lasso.coef[-1]
+    selected_groups <- unique(selected_indicator[which(grp.lasso.coef != 0)])
+    
+    # increment the frequence vector
+    freq[which(selected_indicator %in% selected_groups)] <- freq[which(selected_indicator %in% selected_groups)] + 1
+  }
+  
+  return(freq)
+}
+```
+
+
+
+```{r}
+#### modifed <<exclusive>> stabs lasso - subsample features based on the group structure
+#### subsample 50% features from each corrected group
+#### **** addition need: group indicator for group lasso
+stabs_exclusive_lasso <- function(x, y, group, group_indicator, iteration = 100, prop = 0.5){
+  
+  freq <- rep(0, ncol(x))
+  ng <- length(group)
+  
+  for (i in 1:iteration) {
+    print(paste("This is inner iteration:", i))
+    
+    # randomly select some proportion of features from each correlated group
+    selected <- vector(mode = "logical", length = 0)
+    position <- 1
+    #index <- 0
+    for (j in 1:ng) {
+      start <- position
+      position <- position + group[j]
+      end <- position-1
+      
+      select_num <- floor(group[j] * prop)
+      select_temp <- sample(start:end, size = select_num, replace = FALSE)
+      for (k in 1:select_num) {
+        selected[length(selected)+1] <- select_temp[k]
+      }
+      #index <- index + select_num
+    }
+    selected <- sort(selected)
+  
+    # apply group lasso on subsampled data
+    x.selected <- x[,selected]
+    
+    # need to make a consecutive integer list from selected_indicator
+    selected_indicator <- group_indicator[selected]
+    consecutive <- rep(1, length(selected))
+    for (j in 2:length(selected)) {
+      if (selected_indicator[j] > selected_indicator[j-1]) {
+        consecutive[j:length(selected)] <- consecutive[j-1] + 1
+      }
+    }
+  
+
+    
+    # apply exclusive
+    exlasso <- cv.exclusive_lasso(x.selected, y, groups = consecutive, family = "binomial",
+                                type.measure = "class", nfolds = 10)
+    
+
+    coef.exlasso <- coef(exlasso, s = exlasso$lambda.min)
+    coef.exlasso <- coef.exlasso[-1]
+    
+    # increment the frequence vector
+    freq[selected[which(coef.exlasso != 0)]] <- freq[selected[which(coef.exlasso != 0)]] + 1
+  }
+  
+  return(freq)
+}
+```
+
+
+```{r}
+#### modifed <<adaptive no group>> stabs lasso - subsample features based on the group structure
+#### subsample 50% features from each corrected group
+stabs_adaptive_lasso.no_group <- function(x, y, group, iteration = 100, prop = 0.5){
+  
+  freq <- rep(0, ncol(x))
+  ng <- length(group)
+
+  
+  for (i in 1:iteration) {
+    #print(paste("This is iteration:", i))
+    
+    # randomly subset the predictors
+    sub_n <- floor(prop * ncol(x))
+    selected <- sample(1:ncol(x), size = sub_n, replace = FALSE)
+    selected <- sort(selected)
+    #selected_indicator <- group_indicator[selected]
+    
+    x.selected <- x[,selected]
+    # apply adaptive lasso on subsampled data
+    ridge <- cv.glmnet(x = x.selected, y = y, nfold = 10,
+                       alpha = 0, family = "binomial", standardize = FALSE)
+    coef.ridge <- as.numeric(coef(ridge, s = ridge$lambda.min))[-1]
+
+    ## Perform adaptive LASSO with 10-fold CV
+    alasso <- cv.glmnet(x = x.selected, y = y, nfold = 10, alpha = 1,
+                                penalty.factor = 1 / abs(coef.ridge),
+                                keep = TRUE,  type.measure = "class", 
+                                family = "binomial", standardize = TRUE)
+  
+    sub.lasso.coef <- coef(alasso, s = alasso$lambda.min)
+    sub.lasso.coef <- sub.lasso.coef[-1]
+    #print(sub.lasso.coef)
+    #selected[which(sub.lasso.coef != 0)]
+  
+    # increment the frequence vector
+    freq[selected[which(sub.lasso.coef != 0)]] <- freq[selected[which(sub.lasso.coef != 0)]] + 1
+  }
+  
+  return(freq)
+}
+```
+
+### An example of the correlation structure
+```{r}
+set.seed(2020)
+
+# simulate data
+yx_g <- sim_binary_outcome_mixed_group(n = sample_size, p = p, ratio = ratio, beta = beta, 
+                                   group = group, rho = rho)
+
+y_g <- yx_g$y
+x_g.raw <- yx_g[,2:ncol(yx_g)]
+x_g <- scale(x_g.raw)
+
+# number of observations:
+nrow(x_g)
+# number of predictors:
+ncol(x_g)
+# number of true predictors:
+ceiling(p * ratio)
+# outcome variable summary:
+summary(factor(y_g))
+
+heatmap.2(cor(x_g), scale = "none", col = bluered(100), 
+          dendrogram='none', Rowv=FALSE, Colv=FALSE,trace='none', density.info = "none", symm = TRUE)
+
+#heatmap.2(cor(x_g[,(1:25)]), scale = "none", col = bluered(100), 
+#          dendrogram='none', Rowv=FALSE, Colv=FALSE,trace='none', density.info = "none", symm = TRUE)
+```
+
+
+
+### Simulations
+#### Standard LASSO
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+fs.lasso <- data.frame("accuracy" = -1, "sensitivity" = -1, "specificity" = -1)
+pred.lasso <- data.frame("accuracy" = -1, "sensitivity" = -1, 
+                         "specificity" = -1, "auc" = -1)
+for (i in 1:round) {
+  print(paste("stabs Standard LASSO round: ", i))
+  
+  # generating data
+  yx_g <- sim_binary_outcome_mixed_group(n = sample_size, p = p, ratio = ratio, beta = beta, 
+                                   group = group, rho = rho)
+
+  cut <- floor(sample_size * 4 / 5)
+  y_g <- yx_g$y[1:cut]                          # for training
+  y_v <- yx_g$y[(cut+1):sample_size]            # for testing
+  
+  x_g.raw <- yx_g[,2:ncol(yx_g)]
+  x_g <- scale(x_g.raw)[1:cut,]                  # for training
+  x_v <- scale(x_g.raw)[(cut+1):sample_size,]   # for testing             
+
+  ############################# feature selection #############################
+  # apply modified stabs lasso 
+  m.stabs <- stabs_stabdard_lasso(x = x_g, y = y_g, iteration = 100, group = group)
+
+  # top 25 features
+  stabs.10 <- which(m.stabs %in% sort(m.stabs, decreasing = TRUE)[1:25])
+  
+  # features selected
+  predicted_indicator.stabs <- rep(0, p)
+  predicted_indicator.stabs[stabs.10] <- 1
+
+  # store results
+  cm.fs.stabs <- confusionMatrix(reference = as.factor(true_beta_indicator), 
+                                  data = as.factor(predicted_indicator.stabs),
+                                  positive = "1")
+  temp.fs.stabs <- data.frame("accuracy" = cm.fs.stabs$overall[1], 
+                         "sensitivity" = cm.fs.stabs$byClass[1], 
+                         "specificity" = cm.fs.stabs$byClass[2])
+  fs.lasso <- rbind(fs.lasso, temp.fs.stabs)
+  
+  
+  ############################# next build a prediction model #############################
+  x_g.selected <- x_g[, stabs.10]
+  
+  # adaptive lasso
+  ridge <- cv.glmnet(x = x_g.selected, y = y_g, nfold = 10,
+                    alpha = 0, family = "binomial", standardize = FALSE)
+  ridge.coef <- as.numeric(coef(ridge, s = ridge$lambda.min))[-1]
+  
+  fit <- cv.glmnet(x = x_g.selected, y = y_g, family = "binomial", type.measure = "class", 
+                   alpha = 1, nfolds = 10, standardize = FALSE,
+                   penalty.factor = 1 / abs(ridge.coef))
+
+  # predictions of the min model
+  min.y <- predict(fit, newx = x_v[, stabs.10], s = fit$lambda.min, type = "class")
+
+  # store min prediction results
+  cm.lasso.min <- confusionMatrix(reference = factor(y_v,levels = c("0", "1")), 
+                                  data = as.factor(min.y),
+                                  positive = "1")
+  auc.lasso.min <- auc(roc(response= factor(y_v,levels = c("0", "1")), 
+               predictor = predict(fit, newx = x_v[, stabs.10], s = fit$lambda.1se, type = "link")[,1]))
+  temp.min <- data.frame("accuracy" = cm.lasso.min$overall[1], 
+                         "sensitivity" = cm.lasso.min$byClass[1], 
+                         "specificity" = cm.lasso.min$byClass[2],
+                         "auc" = auc.lasso.min)
+  pred.lasso <- rbind(pred.lasso, temp.min)
+  
+}
+
+pred.lasso <- pred.lasso[pred.lasso$accuracy != -1,]
+fs.lasso <- fs.lasso[fs.lasso$accuracy != -1,]
+```
+
+#### adaptive lasso
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+fs.adaptive <- data.frame("accuracy" = -1, "sensitivity" = -1, "specificity" = -1)
+pred.adaptive <- data.frame("accuracy" = -1, "sensitivity" = -1, 
+                         "specificity" = -1, "auc" = -1)
+for (i in 1:round) {
+  print(paste("stabs adaptive LASSO round: ", i))
+  
+  # generating data
+  yx_g <- sim_binary_outcome_mixed_group(n = sample_size, p = p, ratio = ratio, beta = beta, 
+                                   group = group, rho = rho)
+  
+  cut <- floor(sample_size * 4 / 5)
+  y_g <- yx_g$y[1:cut]                          # for training
+  y_v <- yx_g$y[(cut+1):sample_size]            # for testing
+  
+  x_g.raw <- yx_g[,2:ncol(yx_g)]
+  x_g <- scale(x_g.raw)[1:cut,]                  # for training
+  x_v <- scale(x_g.raw)[(cut+1):sample_size,]   # for testing     
+  
+  ############################# feature selection #############################
+  # apply modified stabs lasso 
+  m.stabs <- stabs_adaptive_lasso(x = x_g, y = y_g, iteration = 100, group = group)
+
+  # top 25 features
+  stabs.10 <- which(m.stabs %in% sort(m.stabs, decreasing = TRUE)[1:25])
+
+  # features selected
+  predicted_indicator.stabs <- rep(0, p)
+  predicted_indicator.stabs[stabs.10] <- 1
+
+  # store results
+  cm.fs.stabs <- confusionMatrix(reference = as.factor(true_beta_indicator), 
+                                  data = as.factor(predicted_indicator.stabs),
+                                  positive = "1")
+  temp.fs.stabs <- data.frame("accuracy" = cm.fs.stabs$overall[1], 
+                         "sensitivity" = cm.fs.stabs$byClass[1], 
+                         "specificity" = cm.fs.stabs$byClass[2])
+  fs.adaptive <- rbind(fs.adaptive, temp.fs.stabs)
+  
+  ############################# next build a prediction model #############################
+  x_g.selected <- x_g[, stabs.10]
+  
+  # adaptive lasso
+  ridge <- cv.glmnet(x = x_g.selected, y = y_g, nfold = 10,
+                    alpha = 0, family = "binomial", standardize = FALSE)
+  ridge.coef <- as.numeric(coef(ridge, s = ridge$lambda.min))[-1]
+  
+  fit <- cv.glmnet(x = x_g.selected, y = y_g, family = "binomial", type.measure = "class", 
+                   alpha = 1, nfolds = 10, standardize = FALSE,
+                   penalty.factor = 1 / abs(ridge.coef))
+
+  # predictions of the min model
+  min.y <- predict(fit, newx = x_v[, stabs.10], s = fit$lambda.min, type = "class")
+
+  # store min prediction results
+  cm.lasso.min <- confusionMatrix(reference = factor(y_v,levels = c("0", "1")), 
+                                  data = as.factor(min.y),
+                                  positive = "1")
+  auc.lasso.min <- auc(roc(response= factor(y_v,levels = c("0", "1")), 
+               predictor = predict(fit, newx = x_v[, stabs.10], s = fit$lambda.1se, type = "link")[,1]))
+  temp.min <- data.frame("accuracy" = cm.lasso.min$overall[1], 
+                         "sensitivity" = cm.lasso.min$byClass[1], 
+                         "specificity" = cm.lasso.min$byClass[2],
+                         "auc" = auc.lasso.min)
+  pred.adaptive <- rbind(pred.adaptive, temp.min)
+  
+}
+pred.adaptive <- pred.adaptive[pred.adaptive$accuracy != -1,]
+fs.adaptive <- fs.adaptive[fs.adaptive$accuracy != -1,]
+```
+
+#### group lasso
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# fs.group <- data.frame("accuracy" = -1, "sensitivity" = -1, "specificity" = -1)
+# for (i in 1:round) {
+#   print(paste("stabs Group LASSO round: ", i))
+#   
+#   # generating data
+#   yx_g <- sim_binary_outcome_mixed_group(n = sample_size, p = p, ratio = ratio, beta = beta, 
+#                                    group = group, rho = rho)
+#   
+# 
+#   y_g <- yx_g$y                        
+# 
+#   x_g.raw <- yx_g[,2:ncol(yx_g)]
+#   x_g <- scale(x_g.raw)     
+#   
+#   # apply modified stabs lasso 
+#   m.stabs <- stabs_group_lasso(x = x_g, y = y_g, iteration = 100, group = group, group_indicator = correct_group)
+# 
+# 
+#   # top 20 features
+#   #stabs.10 <- which(m.stabs %in% sort(m.stabs, decreasing = TRUE)[1:25])
+#   
+#   # top 20 features
+#   topt <- sort(m.stabs, decreasing = TRUE)[20]
+#   stabs.10 <- which(m.stabs > topt )
+# 
+#   # features selected
+#   predicted_indicator.stabs <- rep(0, p)
+#   predicted_indicator.stabs[stabs.10] <- 1
+# 
+#   # store results
+#   cm.fs.stabs <- confusionMatrix(reference = as.factor(true_beta_indicator), 
+#                                   data = as.factor(predicted_indicator.stabs),
+#                                   positive = "1")
+#   temp.fs.stabs <- data.frame("accuracy" = cm.fs.stabs$overall[1], 
+#                          "sensitivity" = cm.fs.stabs$byClass[1], 
+#                          "specificity" = cm.fs.stabs$byClass[2])
+#   fs.group <- rbind(fs.group, temp.fs.stabs)
+#   
+# }
+# 
+# fs.group <- fs.group[fs.group$accuracy != -1,]
+```
+
+#### exclusive lasso
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# fs.exclusive <- data.frame("accuracy" = -1, "sensitivity" = -1, "specificity" = -1)
+# for (i in 1:round) {
+#   print(paste("stabs exclusive LASSO round: ", i))
+#   
+#   # generating data
+#   yx_g <- sim_binary_outcome_mixed_group(n = sample_size, p = p, ratio = ratio, beta = beta, 
+#                                    group = group, rho = rho)
+#   
+# 
+#   y_g <- yx_g$y                        
+# 
+#   x_g.raw <- yx_g[,2:ncol(yx_g)]
+#   x_g <- scale(x_g.raw)     
+#   
+#   # apply modified stabs lasso 
+#   m.stabs <- stabs_exclusive_lasso(x = x_g, y = y_g, iteration = 100, group = group, group_indicator = correct_group)
+# 
+# 
+#   # top 20 features
+#   stabs.10 <- which(m.stabs %in% sort(m.stabs, decreasing = TRUE)[1:20])
+# 
+#   # features selected
+#   predicted_indicator.stabs <- rep(0, p)
+#   predicted_indicator.stabs[stabs.10] <- 1
+# 
+#   # store results
+#   cm.fs.stabs <- confusionMatrix(reference = as.factor(true_beta_indicator), 
+#                                   data = as.factor(predicted_indicator.stabs),
+#                                   positive = "1")
+#   temp.fs.stabs <- data.frame("accuracy" = cm.fs.stabs$overall[1], 
+#                          "sensitivity" = cm.fs.stabs$byClass[1], 
+#                          "specificity" = cm.fs.stabs$byClass[2])
+#   fs.exclusive <- rbind(fs.exclusive, temp.fs.stabs)
+#   
+# }
+# 
+# fs.exclusive <- fs.exclusive[fs.exclusive$accuracy != -1,]
+```
+
+
+#### adaptive lasso no group
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# fs.adaptive.no_group <- data.frame("accuracy" = -1, "sensitivity" = -1, "specificity" = -1)
+# for (i in 1:round) {
+#   print(paste("stabs adaptive LASSO no group round: ", i))
+#   
+#   # generating data
+#   yx_g <- sim_binary_outcome_mixed_group(n = sample_size, p = p, ratio = ratio, beta = beta, 
+#                                    group = group, rho = rho)
+#   
+# 
+#   y_g <- yx_g$y                        
+# 
+#   x_g.raw <- yx_g[,2:ncol(yx_g)]
+#   x_g <- scale(x_g.raw)     
+#   
+#   # apply modified stabs lasso 
+#   m.stabs <- stabs_adaptive_lasso.no_group(x = x_g, y = y_g, iteration = 100, group = group)
+# 
+# 
+#   # top 20 features
+#   stabs.10 <- which(m.stabs %in% sort(m.stabs, decreasing = TRUE)[1:20])
+# 
+#   # features selected
+#   predicted_indicator.stabs <- rep(0, p)
+#   predicted_indicator.stabs[stabs.10] <- 1
+# 
+#   # store results
+#   cm.fs.stabs <- confusionMatrix(reference = as.factor(true_beta_indicator), 
+#                                   data = as.factor(predicted_indicator.stabs),
+#                                   positive = "1")
+#   temp.fs.stabs <- data.frame("accuracy" = cm.fs.stabs$overall[1], 
+#                          "sensitivity" = cm.fs.stabs$byClass[1], 
+#                          "specificity" = cm.fs.stabs$byClass[2])
+#   fs.adaptive.no_group <- rbind(fs.adaptive.no_group, temp.fs.stabs)
+#   
+# }
+# 
+# fs.adaptive.no_group <- fs.adaptive.no_group[fs.adaptive.no_group$accuracy != -1,]
+```
+
+### Plots of simulations results
+```{r, fig.width=15,fig.height=4}
+############################ feature selection plot ############################
+fs.lasso$method <- "1.stabs.standard"
+a1 <- reshape2::melt(fs.lasso)
+
+fs.adaptive$method <- "2.stabs.adaptive"
+b1 <- reshape2::melt(fs.adaptive)
+
+
+
+
+
+result.combined <- rbind(a1, b1)
+p3 <- ggplot(result.combined, aes(x=method, y=value, fill=variable)) +
+  geom_boxplot() + geom_hline(yintercept=c(0.75, 0.5), linetype="dashed", color = "red") + ylim(0, 1) +
+  ggtitle("feature selection") 
+p3
+# output to pdf
+filename <- paste("/Users/dr/Desktop/cart_prediction/simulation_plots.v2/", "modified_stabs.fs.", p, ".ratio", ratio,
+                  ".size", sample_size, ".beta", beta[1], ".pdf", sep = "")
+pdf(filename, width=15, height=5)
+p3 <- ggplot(result.combined, aes(x=method, y=value, fill=variable)) +
+  geom_boxplot() + geom_hline(yintercept=c(0.75, 0.5), linetype="dashed", color = "red") + ylim(0, 1) +
+  ggtitle(paste("fs.mstabs.p", p, ".rho", ratio, ".size", sample_size, ".beta", beta[1], sep = ""))+
+  theme(text = element_text(size=30), axis.text.x = element_text(angle=15, hjust=1))
+p3
+#p3[[1]]
+dev.off()
+
+write.csv(result.combined, paste("/Users/dr/Desktop/cart_prediction/simulation_plots.v2/", 
+                                 "modified_stabs.fs.", p, ".ratio", ratio,".size", sample_size,
+                                 ".beta", beta[1], ".csv", sep = ""))
+
+############################ prediction plot ############################
+# boxplot
+pred.lasso$method <- "1.stabs.standard + adaptive"
+a2 <- reshape2::melt(pred.lasso)
+
+pred.adaptive$method <- "2.stabs.adaptive + adaptive"
+b2 <- reshape2::melt(pred.adaptive)
+
+result.pred.combined <- rbind(a2, b2)
+p2 <- ggplot(result.pred.combined, aes(x=method, y=value, fill=variable)) +
+  geom_boxplot() + geom_hline(yintercept=c(0.75, 0.5), linetype="dashed", color = "red") + ylim(0, 1) +
+  ggtitle(paste("pred.mstabs.p", p, ".rho", ratio, ".size", sample_size, ".beta", beta[1], sep = ""))
+p2
+
+# output to pdf
+filename <- paste("/Users/dr/Desktop/cart_prediction/simulation_plots.v2/", "modified_stabs.pred.", p, ".ratio", ratio,
+                  ".size", sample_size, ".beta", beta[1], ".pdf", sep = "")
+pdf(filename, width=15, height=5)
+p3 <- ggplot(result.pred.combined, aes(x=method, y=value, fill=variable)) +
+  geom_boxplot() + geom_hline(yintercept=c(0.75, 0.5), linetype="dashed", color = "red") + ylim(0, 1) +
+  ggtitle(paste("pred.mstabs.p", p, ".rho", ratio, ".size", sample_size, ".beta", beta[1], sep = ""))+
+  theme(text = element_text(size=30), axis.text.x = element_text(angle=15, hjust=1))
+p3
+#p3[[1]]
+dev.off()
+
+write.csv(result.pred.combined, paste("/Users/dr/Desktop/cart_prediction/simulation_plots.v2/", 
+                                 "modified_stabs.pred.", p, ".ratio", ratio,".size", sample_size,
+                                 ".beta", beta[1], ".csv", sep = ""))
+```
+
+
+
